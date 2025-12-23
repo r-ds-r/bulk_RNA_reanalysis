@@ -1,0 +1,422 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r Libraries}
+rm(list = ls())
+library(biomaRt)
+library(readxl)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(limma)
+library(RColorBrewer)
+library(here)
+library(openxlsx)
+```
+
+```{r functions}
+extract_genes_from_results <- function(results, gene_list, list_name = "") {
+  stats <- results[rownames(results) %in% gene_list, ]
+  
+  if(nrow(stats) > 0) {
+    cat("\n=== ", list_name, " ===\n")
+    cat("Total genes found:", nrow(stats), "\n")
+    cat("Significant (padj < 0.05):", sum(stats$adj.P.Val < 0.05, na.rm = TRUE), "\n")
+    cat("Upregulated:", sum(stats$adj.P.Val < 0.05 & stats$logFC > 0, na.rm = TRUE), "\n")
+    cat("Downregulated:", sum(stats$adj.P.Val < 0.05 & stats$logFC < 0, na.rm = TRUE), "\n")
+  }
+  
+  return(stats)
+}
+
+#save_xlsx <- function(df, filename) {
+#  write.xlsx(df, file = file.path(DATA_PROCESSED, filename), 
+#             sheetName = filename,
+#             overwrite = TRUE)
+#}
+
+
+save_xlsx <- function(df, filename_base) {
+  # Ensure processed folder exists
+  if (!dir.exists(DATA_PROCESSED)) dir.create(DATA_PROCESSED, recursive = TRUE)
+  
+  # Full path to workbook
+  wb_file <- file.path(DATA_PROCESSED, filename_base)
+  
+  # Generate timestamp for the sheet name
+  timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
+  sheet_name <- paste0(tools::file_path_sans_ext(filename_base), "_", timestamp)
+  
+  # Load workbook if exists, else create new
+  if (file.exists(wb_file)) {
+    wb <- loadWorkbook(wb_file)
+  } else {
+    wb <- createWorkbook()
+  }
+  
+  # Add new sheet and write data
+  addWorksheet(wb, sheet_name)
+  writeData(wb, sheet = sheet_name, x = df)
+  
+  # Save workbook (overwrite = TRUE updates existing file)
+  saveWorkbook(wb, wb_file, overwrite = TRUE)
+  
+  message("Saved sheet '", sheet_name, "' to workbook '", wb_file, "'")
+}
+```
+
+```{r figures}
+# Define figure folder
+FIGURES_DIR <- "figures"
+
+# Define custom colors for conditions
+annotation_colors <- list(
+  Condition = c(Sham = "#2B5B3F", SNL = "#C4501B")
+)
+
+# Define high definition figure size
+FIG_WIDTH  <- 3000
+FIG_HEIGHT <- 2400
+FIG_RES    <- 300
+FIG_UNITS  <- "px"
+
+save_png <- function(filename, width = FIG_WIDTH, height = FIG_HEIGHT, res = FIG_RES, units = FIG_UNITS) {
+  filepath <- file.path(FIGURES_DIR, filename)
+  png(filepath, width = width, height = height, units = units, res = res)
+}
+```
+
+#### Loading data
+
+```{r}
+# Output of xlsx files written
+DATA_PROCESSED <- "data/processed"
+
+# Input of counts data
+COUNTS_FILE <- here("data", "raw", "OMIX008150-01.xls")
+if (!file.exists(COUNTS_FILE)) {
+  stop("Counts file not found: ", COUNTS_FILE)
+}
+
+# Pathway gene lists for DGE analysis
+
+load_master_gene_lists <- function() {
+  file <- path.expand("~/Documents/GitHub/Pathway_gene_analysis/master_gene_lists.rds")
+  if (!file.exists(file)) stop("Master gene list not found at: ", file)
+  readRDS(file)
+}
+```
+
+```{r}
+# Connect to Ensembl's mouse database
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+# Load your dataset
+DRGcounts <- read_excel(COUNTS_FILE, sheet = 1)
+SCcounts <- read_excel(COUNTS_FILE, sheet = 2)
+
+# Convert Ensembl IDs to row names
+SCcounts <- as.data.frame(SCcounts)
+rownames(SCcounts) <- SCcounts[,1]
+SCcounts <- SCcounts[,-1]
+DRGcounts <- as.data.frame(DRGcounts)
+rownames(DRGcounts) <- DRGcounts[,1]
+DRGcounts <- DRGcounts[,-1]
+
+```
+
+#### Converting ENSEMBL IDs to conventional gene names
+
+```{r}
+# Convert Ensembl IDs to gene symbols
+SCgenes <- getBM(attributes = c("ensembl_gene_id", "mgi_symbol"),
+               filters = "ensembl_gene_id",
+               values = rownames(SCcounts),
+               mart = mart)
+
+# Merge gene symbols with count data
+SCcounts <- merge(SCgenes, SCcounts, by.x = "ensembl_gene_id", by.y = "row.names", all.y = TRUE)
+
+# Remove duplicates
+SCcounts <- SCcounts[!duplicated(SCcounts$mgi_symbol), ]
+
+# Remove rows with missing gene symbols
+SCcounts <- SCcounts[!is.na(SCcounts$mgi_symbol), ]
+
+# make gene name the row name
+rownames(SCcounts) <- SCcounts$mgi_symbol 
+
+# make list of matching ensembl IDs and gene symbols
+SCgene_info <- data.frame(
+  gene_symbol = SCcounts$mgi_symbol,
+  ensembl_id = SCcounts$ensembl_gene_id,
+  row.names = SCcounts$mgi_symbol
+)
+
+# Remove the redundant columns
+SCcounts <- SCcounts[, !colnames(SCcounts) %in% c("mgi_symbol", "ensembl_gene_id")]
+
+# Create dataframe of sample condition
+SCsample_condition <- data.frame(
+  row.names = colnames(SCcounts), 
+  condition = ifelse(grepl("sham", colnames(SCcounts)), "sham", "SNL") 
+)
+
+## Repeat for DRG
+DRGgenes <- getBM(attributes = c("ensembl_gene_id", "mgi_symbol"),
+               filters = "ensembl_gene_id",
+               values = rownames(DRGcounts),
+               mart = mart)
+DRGcounts <- merge(DRGgenes, DRGcounts, by.x = "ensembl_gene_id", by.y = "row.names", all.y = TRUE)
+DRGcounts <- DRGcounts[!duplicated(DRGcounts$mgi_symbol), ]
+DRGcounts <- DRGcounts[!is.na(DRGcounts$mgi_symbol), ]
+rownames(DRGcounts) <- DRGcounts$mgi_symbol 
+DRGgene_info <- data.frame(
+  gene_symbol = DRGcounts$mgi_symbol,
+  ensembl_id = DRGcounts$ensembl_gene_id,
+  row.names = DRGcounts$mgi_symbol
+)
+DRGcounts <- DRGcounts[, !colnames(DRGcounts) %in% c("mgi_symbol", "ensembl_gene_id")]
+DRGsample_condition <- data.frame(
+  row.names = colnames(DRGcounts), 
+  condition = ifelse(grepl("Sham", colnames(DRGcounts)), "sham", "SNL") 
+)
+
+
+```
+
+#### Converting FPKM reads to log2, Stats analysis
+
+```{r}
+# Log-transform FPKM (add pseudocount to avoid log(0))
+SClog_fpkm <- log2(SCcounts + 1)
+
+# Filter low-expressed genes
+SCkeep <- rowSums(SClog_fpkm > 1) >= 3  # Expressed in at least 3 samples
+SClog_fpkm_filtered <- SClog_fpkm[SCkeep, ]
+
+# Design matrix
+SCdesign <- model.matrix(~0 + condition, data = SCsample_condition)
+colnames(SCdesign) <- c("sham", "SNL")
+
+# Fit linear model (WITHOUT voom, since data is already normalized)
+SCfit <- lmFit(SClog_fpkm_filtered, SCdesign)
+
+# Make contrasts
+SCcontrast <- makeContrasts(SNL_vs_sham = SNL - sham, levels = SCdesign)
+
+# Empirical Bayes
+SCfit2 <- contrasts.fit(SCfit, SCcontrast)
+SCfit2 <- eBayes(SCfit2)
+
+# Results
+SCresults <- topTable(SCfit2, coef = "SNL_vs_sham", n = Inf, sort.by = "P")
+summary(decideTests(SCfit2, p.value = 0.05))
+head(SCresults, 20)
+
+# Save results to file
+save_xlsx(SCresults, "SC_DE_results_SNL_vs_sham.csv")
+
+## REPEAT FOR DRG
+
+DRGlog_fpkm <- log2(DRGcounts + 1)
+DRGkeep <- rowSums(DRGlog_fpkm > 1) >= 3  # Expressed in at least 3 samples
+DRGlog_fpkm_filtered <- DRGlog_fpkm[DRGkeep, ]
+cat("Genes before filtering:", nrow(DRGlog_fpkm), "\n")
+cat("Genes after filtering:", nrow(DRGlog_fpkm_filtered), "\n")
+DRGdesign <- model.matrix(~0 + condition, data = DRGsample_condition)
+colnames(DRGdesign) <- c("sham", "SNL")
+DRGfit <- lmFit(DRGlog_fpkm_filtered, DRGdesign)
+DRGcontrast <- makeContrasts(SNL_vs_sham = SNL - sham, levels = DRGdesign)
+DRGfit2 <- contrasts.fit(DRGfit, DRGcontrast)
+DRGfit2 <- eBayes(DRGfit2)
+DRGresults <- topTable(DRGfit2, coef = "SNL_vs_sham", number = Inf, sort.by = "P")
+summary(decideTests(DRGfit2, p.value = 0.05))
+head(DRGresults, 20)
+
+# Optional: Save results to file
+save_xlsx(DRGresults, "DRG_SNL_vs_sham_results.csv")
+
+
+```
+
+#### Analyzing pathways of interest
+
+```{r}
+master_gene_lists <- load_master_gene_lists()
+
+# Extract pathway-specific results for SC
+## ANTIOXIDANT PATHWAY
+SC_nrf2_stats <- extract_genes_from_results(SCresults, 
+                                            master_gene_lists$all_nrf2, 
+                                            "SC: All Nrf2")
+SC_nrf2_sig_genes <- rownames(SC_nrf2_stats[SC_nrf2_stats$adj.P.Val < 0.05, ])
+
+## INFLAMMATORY PATHWAY
+SC_inflammation_stats <- extract_genes_from_results(SCresults, 
+                                                    master_gene_lists$all_inflammation, 
+                                                    "SC: All Inflammation")
+SC_inflammation_sig_genes <- rownames(SC_inflammation_stats[SC_inflammation_stats$adj.P.Val < 0.05, ])
+
+# Extract pathway-specific results for DRG
+## ANTIOXIDANT PATHWAY
+DRG_nrf2_stats <- extract_genes_from_results(DRGresults,
+                                             master_gene_lists$all_nrf2, 
+                                             "DRG: All Nrf2")
+DRG_nrf2_sig_genes <- rownames(DRG_nrf2_stats[DRG_nrf2_stats$adj.P.Val < 0.05, ])
+
+## INFLAMMATORY PATHWAY
+DRG_inflammation_stats <- extract_genes_from_results(DRGresults, 
+                                                     master_gene_lists$all_inflammation,
+                                                     "DRG: All Inflammation")
+DRG_inflammation_sig_genes <- rownames(DRG_inflammation_stats[DRG_inflammation_stats$adj.P.Val < 0.05, ])
+```
+
+#### Visualization
+
+```{r Antiox_significant}
+
+### ========== ANTIOXIDANT PATHWAY ========== 
+
+## ==== SPINAL CORD ===
+# Extract expression data for significant Nrf2 genes
+SC_nrf2_expr <- SClog_fpkm_filtered[SC_nrf2_sig_genes, ]
+
+# Calculate Z-scores (scale by row)
+SC_nrf2_zscores <- t(scale(t(SC_nrf2_expr)))
+
+# Create annotation for samples
+SC_annotation <- data.frame(
+  Condition = c("Sham", "Sham", "Sham", "SNL", "SNL", "SNL"),
+  row.names = colnames(SC_nrf2_zscores)
+)
+
+# Create heatmap
+save_png("SC_Nrf2_heatmap.png")
+pheatmap(
+  SC_nrf2_zscores,
+  color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
+  annotation_col = SC_annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "SC: Significant Nrf2 Pathway Genes (Z-scores)",
+  fontsize_row = 10
+)
+dev.off()
+
+
+# === DORSAL ROOT GANGLIA ===
+
+# Extract expression data for these genes
+DRG_nrf2_expr <- DRGlog_fpkm_filtered[DRG_nrf2_sig_genes, ]
+
+# Calculate Z-scores (scale by row)
+DRG_nrf2_zscores <- t(scale(t(DRG_nrf2_expr)))
+
+# Create annotation for samples
+DRG_annotation <- data.frame(
+  Condition = c("Sham", "Sham", "Sham", "SNL", "SNL", "SNL"),
+  row.names = colnames(DRG_nrf2_zscores)
+)
+
+# Create heatmap
+save_png("DRG_Nrf2_heatmap.png")
+pheatmap(
+  DRG_nrf2_zscores,
+  color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
+  annotation_col = DRG_annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "DRG: Significant Nrf2 Pathway Genes (Z-scores)",
+  fontsize_row = 10
+)
+dev.off()
+
+cat("Heatmaps saved as:\n")
+cat("- SC_Nrf2_heatmap.png\n")
+cat("- DRG_Nrf2_heatmap.png\n")
+```
+
+```{r}
+### ========== INFLAMMATORY PATHWAY ========== 
+
+## ==== SPINAL CORD ===
+# Extract expression data for significant Nrf2 genes
+SC_inflammation_expr <- SClog_fpkm_filtered[SC_inflammation_sig_genes, ]
+
+# Calculate Z-scores (scale by row)
+SC_inflammation_zscores <- t(scale(t(SC_inflammation_expr)))
+
+# Create annotation for samples
+SC_inflammation_annotation <- data.frame(
+  Condition = c("Sham", "Sham", "Sham", "SNL", "SNL", "SNL"),
+  row.names = colnames(SC_inflammation_zscores)
+)
+
+# Create heatmap
+png("SC_Inflammation_heatmap.png", 
+    width = FIG_WIDTH, 
+    height = FIG_HEIGHT, 
+    res = FIG_RES, 
+    units = FIG_UNITS)
+pheatmap(
+  SC_inflammation_zscores,
+  color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
+  annotation_col = SC_inflammation_annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "SC: Significant Inflammatory Pathway Genes (Z-scores)",
+  fontsize_row = 10
+)
+dev.off()
+
+
+# === DORSAL ROOT GANGLIA ===
+
+# Extract expression data for these genes
+DRG_inflammation_expr <- DRGlog_fpkm_filtered[DRG_inflammation_sig_genes, ]
+
+# Calculate Z-scores (scale by row)
+DRG_inflammation_zscores <- t(scale(t(DRG_inflammation_expr)))
+
+# Create annotation for samples
+DRG_inflammation_annotation <- data.frame(
+  Condition = c("Sham", "Sham", "Sham", "SNL", "SNL", "SNL"),
+  row.names = colnames(DRG_inflammation_zscores)
+)
+
+# Create heatmap
+png("DRG_Inflammation_heatmap.png", 
+    width = FIG_WIDTH, 
+    height = FIG_HEIGHT, 
+    res = FIG_RES,
+    units = FIG_UNITS)
+pheatmap(
+  DRG_inflammation_zscores,
+  color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
+  annotation_col = DRG_inflammation_annotation,
+  annotation_colors = annotation_colors,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  main = "DRG: Significant Nrf2 Pathway Genes (Z-scores)",
+  fontsize_row = 10
+)
+dev.off()
+
+cat("Heatmaps saved as:\n")
+cat("- SC_Inflammation_heatmap.png\n")
+cat("- DRG_Inflammation_heatmap.png\n")
+```

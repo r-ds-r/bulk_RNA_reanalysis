@@ -1,3 +1,4 @@
 data.raw
 *.bam
 *.fastq.gz
+.Rproj.user
