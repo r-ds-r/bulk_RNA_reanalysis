@@ -3,8 +3,14 @@ title: "R Notebook"
 output: html_notebook
 ---
 
-```{r Libraries}
+```{r start-up}
+
+# === clearing workspace ===
+
 rm(list = ls())
+
+# === loading libraries ===
+
 library(biomaRt)
 library(readxl)
 library(ggplot2)
@@ -12,11 +18,67 @@ library(pheatmap)
 library(dplyr)
 library(limma)
 library(RColorBrewer)
+library(viridis)
 library(here)
 library(openxlsx)
+
+# === loading utilities scripts ===
+
+script_files <- sort(list.files(
+  here("R"),
+  pattern = "\\.R$",
+  full.names = TRUE
+))
+
+message("Sourcing scripts: ")
+for (f in script_files) {
+  source(f)
+  message(" ✓ ", basename(f))
+}
+
+# === remove temporary variables ===
+rm(f, script_files)
+
 ```
 
-```{r functions}
+#### FILES CONTAINED IN [ here("R") ] FOLDER
+
+```{r 01_paths}
+# === OUTPUT FOLDER ===
+DATA_PROCESSED <- here("data", "processed")
+if (!dir.exists(DATA_PROCESSED)) {
+  response <- readline(prompt = paste0("Processed data directory not found at: ", DATA_PROCESSED, "\nCreate it? (y/n): "))
+  if (tolower(response) == "y") {
+    dir.create(DATA_PROCESSED, recursive = TRUE)
+    message("Created processed data directory: ", DATA_PROCESSED)
+  } else {
+    stop("Processed data directory does not exist. Please create it manually or choose 'y' to create automatically.")
+  }
+}
+
+# === R SCRIPTS ===
+SCRIPTS_DIR <- here("R")
+if (!dir.exists(SCRIPTS)) {
+  message("R scripts not found at: ", SCRIPTS_DIR)
+  SCRIPTS <- file.choose()
+  message("Selected folder: ", SCRIPTS_DIR)
+}
+
+# === FIGURES FOLDER ===
+FIGURES_DIR <- here("figures")
+if (!dir.exists(FIGURES_DIR)) {
+  response <- readline(prompt = paste0("Figures directory not found at: ", FIGURES_DIR, "\nCreate it? (y/n): "))
+  if (tolower(response) == "y") {
+    dir.create(FIGURES_DIR, recursive = TRUE)
+    message("Created figures directory: ", FIGURES_DIR)
+  } else {
+    stop("Figures directory does not exist. Please create it manually or choose 'y' to create automatically.")
+  }
+}
+
+```
+
+```{r 02_functions}
 extract_genes_from_results <- function(results, gene_list, list_name = "") {
   stats <- results[rownames(results) %in% gene_list, ]
   
@@ -31,23 +93,14 @@ extract_genes_from_results <- function(results, gene_list, list_name = "") {
   return(stats)
 }
 
-#save_xlsx <- function(df, filename) {
-#  write.xlsx(df, file = file.path(DATA_PROCESSED, filename), 
-#             sheetName = filename,
-#             overwrite = TRUE)
-#}
-
-
+## === SAVING EXCEL FILES OF PROCESSED DATA ===
 save_xlsx <- function(df, filename_base) {
-  # Ensure processed folder exists
-  if (!dir.exists(DATA_PROCESSED)) dir.create(DATA_PROCESSED, recursive = TRUE)
   
   # Full path to workbook
   wb_file <- file.path(DATA_PROCESSED, filename_base)
   
   # Generate timestamp for the sheet name
   timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-  sheet_name <- paste0(tools::file_path_sans_ext(filename_base), "_", timestamp)
   
   # Load workbook if exists, else create new
   if (file.exists(wb_file)) {
@@ -56,24 +109,29 @@ save_xlsx <- function(df, filename_base) {
     wb <- createWorkbook()
   }
   
-  # Add new sheet and write data
-  addWorksheet(wb, sheet_name)
-  writeData(wb, sheet = sheet_name, x = df)
+  # Add new sheet with just time stamp as name
+  addWorksheet(wb, timestamp)
+  writeData(wb, sheet = timestamp, x = df)
   
   # Save workbook (overwrite = TRUE updates existing file)
   saveWorkbook(wb, wb_file, overwrite = TRUE)
   
-  message("Saved sheet '", sheet_name, "' to workbook '", wb_file, "'")
+  message("Saved sheet '", timestamp, "' to workbook '", wb_file, "'")
+}
+
+# === SAVING PNG VERSIONS OF PLOTS ===
+save_png <- function(filename, width = FIG_WIDTH, height = FIG_HEIGHT, res = FIG_RES, units = FIG_UNITS) {
+  filepath <- file.path(FIGURES_DIR, filename)
+  png(filepath, width = width, height = height, units = units, res = res)
+  message("Saving figure to:", filepath)
 }
 ```
 
-```{r figures}
-# Define figure folder
-FIGURES_DIR <- "figures"
+```{r 03_figures}
 
 # Define custom colors for conditions
 annotation_colors <- list(
-  Condition = c(Sham = "#2B5B3F", SNL = "#C4501B")
+  condition = c(sham = "#2B5B3F", SNL = "#C4501B", SNI = "#C4501B")
 )
 
 # Define high definition figure size
@@ -82,42 +140,37 @@ FIG_HEIGHT <- 2400
 FIG_RES    <- 300
 FIG_UNITS  <- "px"
 
-save_png <- function(filename, width = FIG_WIDTH, height = FIG_HEIGHT, res = FIG_RES, units = FIG_UNITS) {
-  filepath <- file.path(FIGURES_DIR, filename)
-  png(filepath, width = width, height = height, units = units, res = res)
-}
 ```
 
-#### Loading data
+#### Loading raw data
 
 ```{r}
-# Output of xlsx files written
-DATA_PROCESSED <- "data/processed"
 
 # Input of counts data
-COUNTS_FILE <- here("data", "raw", "OMIX008150-01.xls")
-if (!file.exists(COUNTS_FILE)) {
-  stop("Counts file not found: ", COUNTS_FILE)
+
+DATA_RAW <- here("data", "raw", "OMIX008150-01.xls")
+if (!file.exists(DATA_RAW)) {
+  message("Counts file not found: ", DATA_RAW)
+  DATA_RAW <- file.choose()
+  message("Selected file: ", DATA_RAW)
 }
 
-# Pathway gene lists for DGE analysis
-
-load_master_gene_lists <- function() {
-  file <- path.expand("~/Documents/GitHub/Pathway_gene_analysis/master_gene_lists.rds")
-  if (!file.exists(file)) stop("Master gene list not found at: ", file)
-  readRDS(file)
-}
-```
-
-```{r}
 # Connect to Ensembl's mouse database
 mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
 
+
+```
+
+#### Changing data frame row names
+
+```{r}
+
 # Load your dataset
-DRGcounts <- read_excel(COUNTS_FILE, sheet = 1)
-SCcounts <- read_excel(COUNTS_FILE, sheet = 2)
+DRGcounts <- read_excel(DATA_RAW, sheet = 1)
+SCcounts <- read_excel(DATA_RAW, sheet = 2)
 
 # Convert Ensembl IDs to row names
+
 SCcounts <- as.data.frame(SCcounts)
 rownames(SCcounts) <- SCcounts[,1]
 SCcounts <- SCcounts[,-1]
@@ -181,7 +234,7 @@ DRGgene_info <- data.frame(
 DRGcounts <- DRGcounts[, !colnames(DRGcounts) %in% c("mgi_symbol", "ensembl_gene_id")]
 DRGsample_condition <- data.frame(
   row.names = colnames(DRGcounts), 
-  condition = ifelse(grepl("Sham", colnames(DRGcounts)), "sham", "SNL") 
+  condition = ifelse(grepl("Sham", colnames(DRGcounts)), "sham", "SNI") 
 )
 
 
@@ -217,7 +270,7 @@ summary(decideTests(SCfit2, p.value = 0.05))
 head(SCresults, 20)
 
 # Save results to file
-save_xlsx(SCresults, "SC_DE_results_SNL_vs_sham.csv")
+save_xlsx(SCresults, "SC_DE_results_SNL_vs_sham.xlsx")
 
 ## REPEAT FOR DRG
 
@@ -227,17 +280,141 @@ DRGlog_fpkm_filtered <- DRGlog_fpkm[DRGkeep, ]
 cat("Genes before filtering:", nrow(DRGlog_fpkm), "\n")
 cat("Genes after filtering:", nrow(DRGlog_fpkm_filtered), "\n")
 DRGdesign <- model.matrix(~0 + condition, data = DRGsample_condition)
-colnames(DRGdesign) <- c("sham", "SNL")
+colnames(DRGdesign) <- c("sham", "SNI")
 DRGfit <- lmFit(DRGlog_fpkm_filtered, DRGdesign)
-DRGcontrast <- makeContrasts(SNL_vs_sham = SNL - sham, levels = DRGdesign)
+DRGcontrast <- makeContrasts(SNI_vs_sham = SNI - sham, levels = DRGdesign)
 DRGfit2 <- contrasts.fit(DRGfit, DRGcontrast)
 DRGfit2 <- eBayes(DRGfit2)
-DRGresults <- topTable(DRGfit2, coef = "SNL_vs_sham", number = Inf, sort.by = "P")
+DRGresults <- topTable(DRGfit2, coef = "SNI_vs_sham", number = Inf, sort.by = "P")
 summary(decideTests(DRGfit2, p.value = 0.05))
 head(DRGresults, 20)
 
 # Optional: Save results to file
-save_xlsx(DRGresults, "DRG_SNL_vs_sham_results.csv")
+save_xlsx(DRGresults, "DRG_SNI_vs_sham_results.xlsx")
+
+
+```
+
+#### Quality Control
+
+```{r}
+
+# ===== SPINAL CORD =====
+
+# Sample correlation heatmap
+SC_sample_cor <- cor(SClog_fpkm_filtered, method = "pearson")
+
+save_png("SC_sample_correlation.png")
+pheatmap(
+  SC_sample_cor,
+  color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  annotation_col = SCsample_condition,
+  annotation_row = SCsample_condition,
+  annotation_colors = annotation_colors,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 10,
+  main = "SC: Sample Correlation (Pearson)",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean"
+)
+dev.off()
+
+# PCA analysis
+SC_pca <- prcomp(t(SClog_fpkm_filtered), scale. = TRUE)
+SC_pca_data <- data.frame(
+  PC1 = SC_pca$x[,1],
+  PC2 = SC_pca$x[,2],
+  condition = SCsample_condition$condition,
+  Sample = rownames(SC_pca$x)
+)
+
+# Calculate variance explained
+SC_var_explained <- round(100 * SC_pca$sdev^2 / sum(SC_pca$sdev^2), 1)
+
+# PCA plot
+save_png("SC_PCA.png")
+ggplot(SC_pca_data, aes(x = PC1, y = PC2, color = condition, label = Sample)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -1, size = 3) +
+  scale_color_manual(values = annotation_colors$condition) +
+  labs(
+    title = "SC: Principal Component Analysis",
+    x = paste0("PC1 (", SC_var_explained[1], "% variance)"),
+    y = paste0("PC2 (", SC_var_explained[2], "% variance)")
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "right"
+  )
+dev.off()
+
+# ===== DORSAL ROOT GANGLIA =====
+
+# Sample correlation heatmap
+DRG_sample_cor <- cor(DRGlog_fpkm_filtered, method = "pearson")
+
+save_png("DRG_sample_correlation.png")
+pheatmap(
+  DRG_sample_cor,
+  color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  annotation_col = DRGsample_condition,
+  annotation_row = DRGsample_condition,
+  annotation_colors = annotation_colors,
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  fontsize_number = 10,
+  main = "DRG: Sample Correlation (Pearson)",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean"
+)
+dev.off()
+
+# PCA analysis
+DRG_pca <- prcomp(t(DRGlog_fpkm_filtered), scale. = TRUE)
+DRG_pca_data <- data.frame(
+  PC1 = DRG_pca$x[,1],
+  PC2 = DRG_pca$x[,2],
+  condition = DRGsample_condition$condition,
+  Sample = rownames(DRG_pca$x)
+)
+
+# Calculate variance explained
+DRG_var_explained <- round(100 * DRG_pca$sdev^2 / sum(DRG_pca$sdev^2), 1)
+
+# PCA plot
+save_png("DRG_PCA.png")
+ggplot(DRG_pca_data, aes(x = PC1, y = PC2, color = condition, label = Sample)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -1, size = 3) +
+  scale_color_manual(values = annotation_colors$condition) +
+  labs(
+    title = "DRG: Principal Component Analysis",
+    x = paste0("PC1 (", DRG_var_explained[1], "% variance)"),
+    y = paste0("PC2 (", DRG_var_explained[2], "% variance)")
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "right"
+  )
+dev.off()
+
+# ============================================================
+# INTERPRETATION GUIDELINES
+# ============================================================
+
+cat("\n=== QC Interpretation Guidelines ===\n")
+cat("CORRELATION HEATMAP:\n")
+cat("  - Biological replicates should correlate > 0.90\n")
+cat("  - Within-group correlations should be higher than between-group\n")
+cat("  - Values < 0.85 may indicate outliers\n\n")
+cat("PCA PLOT:\n")
+cat("  - Samples should cluster by condition (sham vs SNL)\n")
+cat("  - Tight clustering within groups = good reproducibility\n")
+cat("  - Outliers appear far from their group\n")
+cat("  - PC1 should ideally separate conditions\n")
 
 
 ```
@@ -245,6 +422,7 @@ save_xlsx(DRGresults, "DRG_SNL_vs_sham_results.csv")
 #### Analyzing pathways of interest
 
 ```{r}
+
 master_gene_lists <- load_master_gene_lists()
 
 # Extract pathway-specific results for SC
@@ -340,12 +518,9 @@ pheatmap(
 )
 dev.off()
 
-cat("Heatmaps saved as:\n")
-cat("- SC_Nrf2_heatmap.png\n")
-cat("- DRG_Nrf2_heatmap.png\n")
 ```
 
-```{r}
+```{r Inflammatory_significant}
 ### ========== INFLAMMATORY PATHWAY ========== 
 
 ## ==== SPINAL CORD ===
@@ -362,11 +537,7 @@ SC_inflammation_annotation <- data.frame(
 )
 
 # Create heatmap
-png("SC_Inflammation_heatmap.png", 
-    width = FIG_WIDTH, 
-    height = FIG_HEIGHT, 
-    res = FIG_RES, 
-    units = FIG_UNITS)
+save_png("SC_Inflammation_heatmap.png")
 pheatmap(
   SC_inflammation_zscores,
   color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
@@ -397,11 +568,7 @@ DRG_inflammation_annotation <- data.frame(
 )
 
 # Create heatmap
-png("DRG_Inflammation_heatmap.png", 
-    width = FIG_WIDTH, 
-    height = FIG_HEIGHT, 
-    res = FIG_RES,
-    units = FIG_UNITS)
+save_png("DRG_Inflammation_heatmap.png")
 pheatmap(
   DRG_inflammation_zscores,
   color = colorRampPalette(rev(brewer.pal(11, "PiYG")))(100),
@@ -416,7 +583,5 @@ pheatmap(
 )
 dev.off()
 
-cat("Heatmaps saved as:\n")
-cat("- SC_Inflammation_heatmap.png\n")
-cat("- DRG_Inflammation_heatmap.png\n")
+
 ```
